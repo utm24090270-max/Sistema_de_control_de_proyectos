@@ -2,7 +2,8 @@ import axios from 'axios';
 
 // Instancia global de Axios apuntando al prefijo /api
 const api = axios.create({
-  baseURL: 'http://localhost:4000/api',
+  // En producción se define VITE_API_URL (por ejemplo https://mi-api.azurewebsites.net/api)
+  baseURL: import.meta.env.VITE_API_URL || 'http://localhost:4000/api',
   headers: {
     'Content-Type': 'application/json'
   }

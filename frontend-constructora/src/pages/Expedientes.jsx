@@ -36,7 +36,6 @@ import {
 } from 'lucide-react';
 import logo from '../assets/logo.jpeg';
 
-const API_URL = 'http://localhost:4000';
 
 const TIPOS_PROCESO_VENTA = [
   'C.infonavit',
@@ -638,6 +637,21 @@ export default function Expedientes() {
       alert(err.response?.data?.error || 'Error al subir el archivo');
     } finally {
       setProcesoIdSubiendo(null);
+    }
+  };
+
+  // Los documentos ya no tienen URL pública: se piden al backend con el token y se abren como archivo temporal
+  const abrirDocumentoExpediente = async (idProceso, tipoDoc) => {
+    const ventana = window.open('', '_blank');
+    try {
+      const res = await api.get(`/procesos-venta/${idProceso}/documento/${encodeURIComponent(tipoDoc)}`, { responseType: 'blob' });
+      const url = URL.createObjectURL(res.data);
+      if (ventana) ventana.location.href = url;
+      else window.open(url, '_blank');
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (err) {
+      if (ventana) ventana.close();
+      alert('No se pudo abrir el documento. Verifica que siga disponible o vuelve a cargarlo.');
     }
   };
 
@@ -1747,8 +1761,6 @@ export default function Expedientes() {
                           ) : (
                             <div className="flex flex-wrap gap-2">
                               {documentosSubidos.map((doc) => {
-                                const rutaRelativa = expedienteSeleccionado.rutas_documentos[doc];
-                                const urlCompleta = `${API_URL}${rutaRelativa}`;
 
                                 return (
                                   <div 
@@ -1758,14 +1770,13 @@ export default function Expedientes() {
                                     <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0" />
                                     <span className="font-bold">{doc}</span>
 
-                                    <a
-                                      href={urlCompleta}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="inline-flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 text-white px-2 py-0.5 rounded text-[10px] font-bold transition ml-1"
+                                    <button
+                                      type="button"
+                                      onClick={() => abrirDocumentoExpediente(expedienteSeleccionado.id_proceso, doc)}
+                                      className="inline-flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 text-white px-2 py-0.5 rounded text-[10px] font-bold transition ml-1 cursor-pointer"
                                     >
                                       Ver <ExternalLink className="w-3 h-3" />
-                                    </a>
+                                    </button>
 
                                     {esAdmin && (
                                       <button
@@ -2075,14 +2086,13 @@ export default function Expedientes() {
                                     <td className="p-3 text-center">
                                       {adjuntado ? (
                                         <div className="flex items-center justify-center gap-2">
-                                          <a
-                                            href={`${API_URL}${rutaRelativa}`}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-2.5 py-1 rounded text-[10px] inline-flex items-center gap-1 transition shadow-sm"
+                                          <button
+                                            type="button"
+                                            onClick={() => abrirDocumentoExpediente(expedienteSeleccionado.id_proceso, docKey)}
+                                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-2.5 py-1 rounded text-[10px] inline-flex items-center gap-1 transition shadow-sm cursor-pointer"
                                           >
                                             Ver Documento <ExternalLink className="w-3 h-3" />
-                                          </a>
+                                          </button>
                                           <button
                                             type="button"
                                             onClick={() => handleEliminarDocumento(expedienteSeleccionado.id_proceso, docKey)}

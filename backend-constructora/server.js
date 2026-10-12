@@ -2,6 +2,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const storage = require('./storage');
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
@@ -17,8 +18,43 @@ if (!process.env.JWT_SECRET) {
 
 const app = express();
 
-app.use(cors());
+// Detrás del proxy de Azure App Service (necesario para HTTPS y para limitar por IP real)
+app.set('trust proxy', 1);
+
+// Cabeceras de seguridad (npm install helmet). Si no está instalado, el servidor sigue funcionando.
+try {
+  const helmet = require('helmet');
+  app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+} catch (e) {
+  console.warn('⚠️ helmet no está instalado: ejecuta "npm install helmet" antes de desplegar.');
+}
+
+// CORS: solo los orígenes permitidos (variable CORS_ORIGIN, separados por coma).
+// Sin la variable, solo se permite el frontend local de desarrollo.
+const ORIGENES_PERMITIDOS = (process.env.CORS_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173')
+  .split(',').map((o) => o.trim()).filter(Boolean);
+app.use(cors({
+  origin: (origin, cb) => cb(null, !origin || ORIGENES_PERMITIDOS.includes(origin)) // sin origin = herramientas/servidor
+}));
 app.use(express.json());
+
+// Límite de intentos en login y registro (npm install express-rate-limit)
+let limitarAutenticacion = (req, res, next) => next();
+try {
+  const { rateLimit } = require('express-rate-limit');
+  limitarAutenticacion = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 30,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'Demasiados intentos. Intenta de nuevo en unos minutos.' }
+  });
+} catch (e) {
+  console.warn('⚠️ express-rate-limit no está instalado: ejecuta "npm install express-rate-limit" antes de desplegar.');
+}
+
+// En producción no se devuelven detalles internos (mensajes de SQL, etc.) al cliente
+const detalleError = (err) => (process.env.NODE_ENV === 'production' ? undefined : err.message);
 
 // ==========================================
 // MIDDLEWARES DE SEGURIDAD (JWT Y ROLES)
@@ -291,39 +327,53 @@ async function completarCodigosInventario() {
   }
 }
 
-// Servir estáticamente los archivos subidos para consulta directa
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// IMPORTANTE: la carpeta uploads/ YA NO se sirve de forma pública.
+// Los documentos se consultan solo con GET /api/procesos-venta/:id/documento/:tipo (token + permisos).
 
-// Configuración del almacenamiento con Multer
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, `${uniqueSuffix}${path.extname(file.originalname)}`);
+// ---------- Recepción y validación de archivos (compartido por expedientes e inventario) ----------
+const DOC_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+const DOC_FORMATOS = {
+  '.pdf': 'application/pdf',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png'
+};
+
+// Comprueba la firma real del archivo (no basta con la extensión que envía el navegador)
+const firmaBufferValida = (buffer, ext) => {
+  if (!buffer || buffer.length < 8) return false;
+  if (ext === '.pdf') return buffer.slice(0, 4).toString('latin1') === '%PDF';
+  if (ext === '.png') return buffer.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  return buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff; // jpg / jpeg
+};
+
+// El archivo llega en memoria (máx. 10 MB); la capa de almacenamiento decide dónde guardarlo
+const recibirEnMemoria = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: DOC_MAX_BYTES, files: 1 },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (DOC_FORMATOS[ext] !== file.mimetype) {
+      return cb(errorHttp(400, 'Formato no permitido. Solo se aceptan archivos PDF, JPG o PNG.'));
+    }
+    cb(null, true);
   }
 });
 
-const upload = multer({ storage });
-
-// Función auxiliar para eliminar archivos físicos de forma segura
-const borrarArchivoFisico = (rutaRelativa) => {
-  if (!rutaRelativa) return;
-  const rutaAbsoluta = path.join(__dirname, rutaRelativa);
-  fs.unlink(rutaAbsoluta, (err) => {
-    if (err && err.code !== 'ENOENT') {
-      console.error(`⚠️ No se pudo eliminar el archivo físico ${rutaAbsoluta}:`, err.message);
-    }
+const recibirArchivo = (campo) => (req, res, next) =>
+  recibirEnMemoria.single(campo)(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'El archivo excede el tamaño máximo de 10 MB.' });
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    return res.status(400).json({ error: 'No se pudo recibir el archivo.' });
   });
-};
 
 // ==========================================
 // RUTAS DE AUTENTICACIÓN (LOGIN Y REGISTRO)
 // ==========================================
 
 // POST: Registrar un nuevo usuario + cliente + expediente inicial de compra
-app.post('/api/auth/registro', async (req, res) => {
+app.post('/api/auth/registro', limitarAutenticacion, async (req, res) => {
   const { nombre, apellido, email, password, telefono, curp, rfc, direccion, tipo_construccion, institucion_financiera, id_empresa } = req.body;
   // El registro público NUNCA asigna lote: lo asigna un ADMIN/ASESOR después
   const id_terreno = null;
@@ -393,7 +443,7 @@ app.post('/api/auth/registro', async (req, res) => {
     await client.query('ROLLBACK');
     console.error('❌ Error detallado en registro:', err.message);
     
-    let mensajeError = `Error al registrar: ${err.message}`;
+    let mensajeError = 'Error al registrar el usuario';
     if (err.message.includes('duplicate key') || err.code === '23505') {
       mensajeError = 'El correo electrónico ya está registrado';
     } else if (err.message.includes('violates foreign key constraint') || err.code === '23503') {
@@ -407,7 +457,7 @@ app.post('/api/auth/registro', async (req, res) => {
 });
 
 // POST: Iniciar sesión (Login)
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', limitarAutenticacion, async (req, res) => {
   const { email, password } = req.body;
   try {
     const userResult = await pool.query(
@@ -717,48 +767,54 @@ app.post('/api/procesos-venta/regenerar-cliente', verificarToken, async (req, re
     await client.query('ROLLBACK');
     console.error('❌ Error exacto al regenerar expediente:', err);
     res.status(500).json({ 
-      error: `Error al generar expediente: ${err.message}` 
+      error: 'Error al generar expediente', details: detalleError(err)
     });
   } finally {
     client.release();
   }
 });
 
-app.post('/api/procesos-venta/:id/documento', verificarToken, upload.single('documento'), async (req, res) => {
+app.post('/api/procesos-venta/:id/documento', verificarToken, recibirArchivo('documento'), async (req, res) => {
   const { id } = req.params;
-  const { tipo_documento } = req.body;
-
-  if (!req.file) {
-    return res.status(400).json({ error: 'No se ha adjuntado ningún archivo.' });
-  }
+  const tipo_documento = String(req.body.tipo_documento || '').trim();
+  let nombreNuevo = null;
 
   try {
-    const procesoRes = await pool.query('SELECT rutas_documentos, id_cliente FROM proceso_venta WHERE id_proceso = $1', [id]);
-    if (procesoRes.rows.length === 0) {
-      borrarArchivoFisico(`/uploads/${req.file.filename}`);
-      return res.status(404).json({ error: 'Expediente no encontrado.' });
+    if (!req.file) throw errorHttp(400, 'No se ha adjuntado ningún archivo.');
+    if (!tipo_documento || tipo_documento.length > 80 || ['__proto__', 'constructor', 'prototype'].includes(tipo_documento)) {
+      throw errorHttp(400, 'Tipo de documento inválido.');
     }
+
+    const procesoRes = await pool.query('SELECT rutas_documentos, id_cliente FROM proceso_venta WHERE id_proceso = $1', [id]);
+    if (procesoRes.rows.length === 0) throw errorHttp(404, 'Expediente no encontrado.');
     if (!puedeAccederProceso(req.usuario, procesoRes.rows[0].id_cliente)) {
-      borrarArchivoFisico(`/uploads/${req.file.filename}`);
-      return res.status(403).json({ error: 'No tienes permisos sobre este expediente.' });
+      throw errorHttp(403, 'No tienes permisos sobre este expediente.');
+    }
+
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    if (!firmaBufferValida(req.file.buffer, ext)) {
+      throw errorHttp(400, 'El contenido del archivo no corresponde a su formato (PDF, JPG o PNG).');
     }
 
     let rutasDocumentos = procesoRes.rows[0].rutas_documentos || {};
-    if (typeof rutasDocumentos === 'string') {
-      rutasDocumentos = JSON.parse(rutasDocumentos);
-    }
+    if (typeof rutasDocumentos === 'string') rutasDocumentos = JSON.parse(rutasDocumentos);
+    const anterior = rutasDocumentos[tipo_documento];
 
-    if (rutasDocumentos[tipo_documento]) {
-      borrarArchivoFisico(rutasDocumentos[tipo_documento]);
-    }
+    // La ruta guardada conserva el formato histórico (/uploads/<archivo>) para no romper expedientes existentes
+    nombreNuevo = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
+    await storage.guardar('expedientes', nombreNuevo, req.file.buffer, DOC_FORMATOS[ext]);
 
-    const rutaArchivo = `/uploads/${req.file.filename}`;
+    const rutaArchivo = `/uploads/${nombreNuevo}`;
     rutasDocumentos[tipo_documento] = rutaArchivo;
 
     await pool.query(
       'UPDATE proceso_venta SET rutas_documentos = $1::jsonb WHERE id_proceso = $2',
       [JSON.stringify(rutasDocumentos), id]
     );
+
+    if (typeof anterior === 'string' && anterior.startsWith('/uploads/')) {
+      storage.borrar('expedientes', path.basename(anterior)).catch((e) => console.error('⚠️ No se pudo borrar el archivo anterior:', e.message));
+    }
 
     res.json({
       mensaje: 'Documento subido correctamente',
@@ -767,9 +823,38 @@ app.post('/api/procesos-venta/:id/documento', verificarToken, upload.single('doc
       rutas_documentos: rutasDocumentos
     });
   } catch (err) {
-    borrarArchivoFisico(`/uploads/${req.file.filename}`);
-    console.error('❌ Error al subir el documento:', err.message);
-    res.status(500).json({ error: 'Error al procesar el archivo en el servidor' });
+    if (nombreNuevo) storage.borrar('expedientes', nombreNuevo).catch(() => {});
+    responderError(res, err, 'Error al procesar el archivo en el servidor');
+  }
+});
+
+// GET: Consultar un documento de un expediente (token + permisos; ya no hay URL pública)
+app.get('/api/procesos-venta/:id/documento/:tipo', verificarToken, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT rutas_documentos, id_cliente FROM proceso_venta WHERE id_proceso = $1', [parseInt(req.params.id, 10) || 0]);
+    if (r.rows.length === 0) throw errorHttp(404, 'Expediente no encontrado.');
+    if (!puedeAccederProceso(req.usuario, r.rows[0].id_cliente)) throw errorHttp(403, 'No tienes permisos sobre este expediente.');
+
+    let rutas = r.rows[0].rutas_documentos || {};
+    if (typeof rutas === 'string') rutas = JSON.parse(rutas);
+    const ruta = Object.prototype.hasOwnProperty.call(rutas, req.params.tipo) ? rutas[req.params.tipo] : null;
+    if (typeof ruta !== 'string' || !ruta.startsWith('/uploads/')) throw errorHttp(404, 'Documento no encontrado.');
+
+    const nombre = path.basename(ruta);
+    const flujo = await storage.abrir('expedientes', nombre);
+    if (!flujo) throw errorHttp(404, 'El archivo ya no está disponible en el servidor.');
+
+    const ext = path.extname(nombre).toLowerCase();
+    const mime = DOC_FORMATOS[ext];
+    const nombreDescarga = `${req.params.tipo}${ext}`.replace(/[\\/\u0000-\u001f]/g, '_');
+    res.setHeader('Content-Type', mime || 'application/octet-stream');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Content-Disposition', `${mime ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(nombreDescarga)}`);
+    flujo.on('error', () => { if (!res.headersSent) res.status(500).json({ error: 'No se pudo leer el archivo.' }); else res.destroy(); });
+    flujo.pipe(res);
+  } catch (err) {
+    responderError(res, err, 'Error al consultar el documento');
   }
 });
 
@@ -921,7 +1006,7 @@ app.post('/api/procesos-venta', verificarToken, async (req, res) => {
         tipoConstruccionFinal,
         institucionFinancieraFinal,
         etapa_actual || 'Evaluación',
-        JSON.stringify(rutas_documentos || {}),
+        '{}', // las rutas de documentos solo se crean al subir archivos, nunca desde el cuerpo de la petición
         JSON.stringify(estados_binarios || {}),
         marcarTercero,
         datosTercero.nombre,
@@ -948,7 +1033,7 @@ app.post('/api/procesos-venta', verificarToken, async (req, res) => {
     await client.query('ROLLBACK');
     if (err.status) return res.status(err.status).json({ error: err.message });
     console.error('❌ Error al crear proceso de venta:', err.message);
-    res.status(500).json({ error: 'Error al iniciar el proceso de venta: ' + err.message });
+    res.status(500).json({ error: 'Error al iniciar el proceso de venta', details: detalleError(err) });
   } finally {
     client.release();
   }
@@ -981,7 +1066,7 @@ app.put('/api/procesos-venta/:id/lote', verificarToken, verificarRol(ROLES_STAFF
     await client.query('ROLLBACK');
     if (err.status) return res.status(err.status).json({ error: err.message });
     console.error('❌ Error al asignar lote:', err.message);
-    res.status(500).json({ error: 'Error al asignar el lote', details: err.message });
+    res.status(500).json({ error: 'Error al asignar el lote', details: detalleError(err) });
   } finally {
     client.release();
   }
@@ -1075,7 +1160,15 @@ app.put('/api/procesos-venta/:id', verificarToken, async (req, res) => {
     }
 
     if (rutas_documentos !== undefined) {
-      await client.query('UPDATE proceso_venta SET rutas_documentos = $1::jsonb WHERE id_proceso = $2', [JSON.stringify(rutas_documentos), id]);
+      // Desde aquí solo se pueden QUITAR documentos. Agregar o cambiar una ruta ocurre únicamente
+      // al subir un archivo; así nadie puede apuntar su expediente al archivo de otra persona.
+      const actualRes = await client.query("SELECT COALESCE(rutas_documentos, '{}'::jsonb) AS rutas FROM proceso_venta WHERE id_proceso = $1", [id]);
+      const actuales = actualRes.rows[0]?.rutas || {};
+      const conservadas = {};
+      for (const [clave, valor] of Object.entries(rutas_documentos || {})) {
+        if (Object.prototype.hasOwnProperty.call(actuales, clave) && actuales[clave] === valor) conservadas[clave] = valor;
+      }
+      await client.query('UPDATE proceso_venta SET rutas_documentos = $1::jsonb WHERE id_proceso = $2', [JSON.stringify(conservadas), id]);
     }
 
     await client.query('COMMIT');
@@ -1126,7 +1219,7 @@ app.put('/api/procesos-venta/:id', verificarToken, async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('❌ Error al actualizar expediente:', err.message);
-    res.status(500).json({ error: 'Error al actualizar el expediente', details: err.message });
+    res.status(500).json({ error: 'Error al actualizar el expediente', details: detalleError(err) });
   } finally {
     client.release();
   }
@@ -1601,9 +1694,6 @@ app.put('/api/solicitudes-lote/:id/rechazar', verificarToken, verificarRol(ROLES
 //    solo salen por GET /api/inventario/documentos/:id/archivo con token y rol.
 //  - En la base de datos solo se guardan los metadatos (tabla documento_inventario).
 // ==========================================
-const DOCS_INVENTARIO_DIR = process.env.DOCS_INVENTARIO_DIR || path.join(__dirname, 'storage_privado', 'inventario');
-fs.mkdirSync(DOCS_INVENTARIO_DIR, { recursive: true });
-
 // Catálogo de documentos por nivel inmobiliario (columna = FK real hacia el elemento)
 const DOCUMENTOS_INVENTARIO = {
   LOTE: {
@@ -1624,46 +1714,7 @@ const DOCUMENTOS_INVENTARIO = {
   }
 };
 
-const DOC_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
-const DOC_FORMATOS = {
-  '.pdf': 'application/pdf',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.png': 'image/png'
-};
-
-// Comprueba la firma real del archivo (no basta con la extensión que envía el navegador)
-const firmaArchivoValida = (ruta, ext) => {
-  const fd = fs.openSync(ruta, 'r');
-  const b = Buffer.alloc(8);
-  fs.readSync(fd, b, 0, 8, 0);
-  fs.closeSync(fd);
-  if (ext === '.pdf') return b.slice(0, 4).toString('latin1') === '%PDF';
-  if (ext === '.png') return b.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
-  return b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff; // jpg / jpeg
-};
-
-const subirDocInventario = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, DOCS_INVENTARIO_DIR),
-    // Nombre aleatorio en disco: el nombre original nunca se usa como ruta
-    filename: (req, file, cb) => cb(null, `${crypto.randomBytes(16).toString('hex')}${path.extname(file.originalname).toLowerCase()}`)
-  }),
-  limits: { fileSize: DOC_MAX_BYTES, files: 1 },
-  fileFilter: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (DOC_FORMATOS[ext] !== file.mimetype) return cb(errorHttp(400, 'Formato no permitido. Solo se aceptan archivos PDF, JPG o PNG.'));
-    cb(null, true);
-  }
-}).single('archivo');
-
-const recibirDocInventario = (req, res, next) =>
-  subirDocInventario(req, res, (err) => {
-    if (!err) return next();
-    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'El archivo excede el tamaño máximo de 10 MB.' });
-    if (err.status) return res.status(err.status).json({ error: err.message });
-    return res.status(400).json({ error: 'No se pudo recibir el archivo.' });
-  });
+const recibirDocInventario = recibirArchivo('archivo');
 
 // Verifica que el elemento exista, sea de la empresa del usuario y admita documentos
 async function validarElementoInventario(req, nivel, idElemento) {
@@ -1762,7 +1813,8 @@ app.get('/api/inventario/documentos', verificarToken, verificarRol(ROLES_ADMIN),
 
 // Cargar o reemplazar un documento (la versión anterior se conserva como historial)
 app.post('/api/inventario/documentos', verificarToken, verificarRol(ROLES_ADMIN), recibirDocInventario, async (req, res) => {
-  const descartarArchivo = () => { if (req.file) fs.unlink(req.file.path, () => {}); };
+  let nombreAlmacenado = null;
+  const descartarArchivo = () => { if (nombreAlmacenado) storage.borrar('inventario', nombreAlmacenado).catch(() => {}); };
   let client = null;
   try {
     if (!req.file) throw errorHttp(400, 'No se ha adjuntado ningún archivo.');
@@ -1772,11 +1824,14 @@ app.post('/api/inventario/documentos', verificarToken, verificarRol(ROLES_ADMIN)
     const { cfg, id } = await validarElementoInventario(req, nivel, req.body.id_elemento);
     if (!cfg.tipos[tipo]) throw errorHttp(400, 'Ese tipo de documento no corresponde al nivel seleccionado.');
 
-    const ext = path.extname(req.file.filename).toLowerCase();
-    if (!firmaArchivoValida(req.file.path, ext)) {
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    if (!firmaBufferValida(req.file.buffer, ext)) {
       throw errorHttp(400, 'El contenido del archivo no corresponde a su formato (PDF, JPG o PNG).');
     }
     const nombreOriginal = nombreArchivoSeguro(req.file.originalname);
+
+    nombreAlmacenado = `${crypto.randomBytes(16).toString('hex')}${ext}`;
+    await storage.guardar('inventario', nombreAlmacenado, req.file.buffer, DOC_FORMATOS[ext]);
 
     client = await pool.connect();
     await client.query('BEGIN');
@@ -1797,7 +1852,7 @@ app.post('/api/inventario/documentos', verificarToken, verificarRol(ROLES_ADMIN)
            (nivel, tipo_documento, ${cfg.columna}, nombre_original, archivo_almacenado, mime_type, tamano_bytes, id_usuario_admin)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING id_documento, fecha_carga`,
-        [nivel, tipo, id, nombreOriginal, req.file.filename, DOC_FORMATOS[ext], req.file.size, req.usuario.id_usuario || null]);
+        [nivel, tipo, id, nombreOriginal, nombreAlmacenado, DOC_FORMATOS[ext], req.file.size, req.usuario.id_usuario || null]);
     } catch (e) {
       if (e.code === '23505') throw errorHttp(409, 'Otro administrador cargó este documento al mismo tiempo. Vuelve a intentarlo.');
       throw e;
@@ -1837,9 +1892,9 @@ app.get('/api/inventario/documentos/:id/archivo', verificarToken, verificarRol(R
     // Misma validación de empresa que al consultar el elemento
     await validarElementoInventario(req, d.nivel, d[DOCUMENTOS_INVENTARIO[d.nivel].columna]);
 
-    // basename evita que una referencia manipulada salga de la carpeta privada
-    const rutaAbs = path.join(DOCS_INVENTARIO_DIR, path.basename(d.archivo_almacenado));
-    if (!fs.existsSync(rutaAbs)) throw errorHttp(404, 'El archivo ya no está disponible en el servidor.');
+    // basename evita que una referencia manipulada salga del contenedor privado
+    const flujo = await storage.abrir('inventario', path.basename(d.archivo_almacenado));
+    if (!flujo) throw errorHttp(404, 'El archivo ya no está disponible en el servidor.');
 
     const disposicion = req.query.descargar === '1' ? 'attachment' : 'inline';
     res.setHeader('Content-Type', d.mime_type || 'application/octet-stream');
@@ -1847,7 +1902,6 @@ app.get('/api/inventario/documentos/:id/archivo', verificarToken, verificarRol(R
     res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('Content-Disposition', `${disposicion}; filename*=UTF-8''${encodeURIComponent(d.nombre_original)}`);
 
-    const flujo = fs.createReadStream(rutaAbs);
     flujo.on('error', () => { if (!res.headersSent) res.status(500).json({ error: 'No se pudo leer el archivo.' }); else res.destroy(); });
     flujo.pipe(res);
   } catch (err) {
@@ -1858,6 +1912,11 @@ app.get('/api/inventario/documentos/:id/archivo', verificarToken, verificarRol(R
 // ==========================================
 // INICIO DEL SERVIDOR
 // ==========================================
+if (process.env.NODE_ENV === 'production' && !process.env.CORS_ORIGIN) {
+  console.warn('⚠️ NODE_ENV=production sin CORS_ORIGIN: ningún navegador externo podrá usar la API.');
+}
+console.log(`📁 Almacenamiento de documentos: ${storage.usaAzure() ? 'Azure Blob Storage' : 'disco local'}`);
+
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 Servidor ejecutándose en http://localhost:${PORT}`);
