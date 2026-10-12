@@ -1,0 +1,108 @@
+### Test 1: Comprobar estado del servidor
+GET http://localhost:4000/api/health
+
+###
+
+### Test 2: Consultar lista de clientes (inicialmente vacía)
+GET http://localhost:4000/api/clientes
+
+###
+
+### Test 3: Registrar un nuevo cliente
+POST http://localhost:4000/api/clientes
+Content-Type: application/json
+
+{
+  "id_empresa": 1,
+  "nombre": "Carlos",
+  "apellido": "Mendoza",
+  "curp": "MEMC900101HDFRRL01",
+  "rfc": "MEMC900101ABC",
+  "email": "carlos.mendoza@email.com",
+  "telefono": "5551234567"
+}
+
+### Test 4: Registrar un terreno
+POST http://localhost:4000/api/terrenos
+Content-Type: application/json
+
+{
+  "id_empresa": 1,
+  "num_lote": "Lote 15",
+  "manzana": "Mz A",
+  "m2": 120.50,
+  "precio": 850000.00,
+  "estado": "DISPONIBLE"
+}
+
+###
+
+### Test 5: Iniciar Proceso de Venta (Cliente 1 + Terreno 1)
+POST http://localhost:4000/api/procesos-venta
+Content-Type: application/json
+
+{
+  "id_cliente": 1,
+  "id_terreno": 1,
+  "institucion_financiera": "INFONAVIT",
+  "etapa_actual": "INTEGRACION_EXPEDIENTE"
+}
+
+###
+
+### Test 6: Ver expedientes completos con JOIN
+GET http://localhost:4000/api/procesos-venta
+
+### Test 7: Consultar Bitácora de Auditoría
+GET http://localhost:4000/api/bitacora
+
+### Test 8: Registrar usuario Admin
+POST http://localhost:4000/api/auth/registro
+Content-Type: application/json
+
+{
+  "id_empresa": 1,
+  "nombre": "Admin General",
+  "email": "admin@constructora.com",
+  "password": "Password123!",
+  "rol": "ADMIN"
+}
+
+###
+
+### Test 9: Iniciar Sesión (Obtener JWT Token)
+POST http://localhost:4000/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "admin@constructora.com",
+  "password": "Password123!"
+}
+
+### Test 10: Crear Proceso de Venta (Protegido con JWT)
+POST http://localhost:4000/api/procesos-venta
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZF91c3VhcmlvIjoxLCJyb2wiOiJBRE1JTiIsImlkX2VtcHJlc2EiOjEsImlhdCI6MTc3NDM4NDYwOSwiZXhwIjoxNzc0NDEzODE5fQ.v0fZAsAD1gheUJJuRHaDmkSBZwYkErewazCFIYtcqH0
+
+{
+  "id_cliente": 1,
+  "id_terreno": 1,
+  "institucion_financiera": "BANCO",
+  "etapa_actual": "INTEGRACION_EXPEDIENTE"
+}
+
+### Test 11: Subir documento PDF/Imagen al expediente (id_proceso = 7)
+POST http://localhost:4000/api/procesos-venta/7/documento
+Authorization: Bearer PEGA_AQUI_TU_TOKEN_JWT
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="tipo_documento"
+
+INE
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="documento"; filename="ine_cliente.pdf"
+Content-Type: application/pdf
+
+< ./ine_cliente.pdf
+------WebKitFormBoundary7MA4YWxkTrZu0gW--

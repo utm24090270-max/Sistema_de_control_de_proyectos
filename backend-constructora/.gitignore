@@ -1,0 +1,14 @@
+# Dependencias
+node_modules
+
+# Secretos y configuración local (NUNCA subir a Git)
+.env
+.env.*
+
+# Archivos de usuarios: documentos de clientes y del inventario
+uploads/
+storage_privado/
+ine_cliente.jpg
+
+# Logs
+*.log
