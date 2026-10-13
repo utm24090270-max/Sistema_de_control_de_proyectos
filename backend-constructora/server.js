@@ -339,13 +339,21 @@ const DOC_FORMATOS = {
   '.png': 'image/png'
 };
 
-// Comprueba la firma real del archivo (no basta con la extensión que envía el navegador)
-const firmaBufferValida = (buffer, ext) => {
-  if (!buffer || buffer.length < 8) return false;
-  if (ext === '.pdf') return buffer.slice(0, 4).toString('latin1') === '%PDF';
-  if (ext === '.png') return buffer.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
-  return buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff; // jpg / jpeg
+// Detecta el tipo REAL del archivo por su contenido (no por el nombre que trae).
+// Devuelve '.pdf', '.png', '.jpg' o null si no es ninguno de los permitidos.
+// Así un JPG guardado con nombre "documento.pdf" se acepta con su tipo correcto,
+// y un ejecutable o una página web renombrados se rechazan.
+const detectarExtensionReal = (buffer) => {
+  if (!buffer || buffer.length < 8) return null;
+  // PDF: la marca %PDF- puede aparecer dentro de los primeros 1024 bytes (así lo acepta Acrobat)
+  if (buffer.slice(0, 1024).toString('latin1').includes('%PDF-')) return '.pdf';
+  if (buffer.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return '.png';
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return '.jpg';
+  return null;
 };
+
+const MENSAJE_ARCHIVO_INVALIDO =
+  'El archivo no es un PDF, JPG o PNG válido. Si es una página web o un documento de otro tipo, conviértelo a PDF, JPG o PNG e inténtalo de nuevo.';
 
 // El archivo llega en memoria (máx. 10 MB); la capa de almacenamiento decide dónde guardarlo
 const recibirEnMemoria = multer({
@@ -791,10 +799,8 @@ app.post('/api/procesos-venta/:id/documento', verificarToken, recibirArchivo('do
       throw errorHttp(403, 'No tienes permisos sobre este expediente.');
     }
 
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    if (!firmaBufferValida(req.file.buffer, ext)) {
-      throw errorHttp(400, 'El contenido del archivo no corresponde a su formato (PDF, JPG o PNG).');
-    }
+    const ext = detectarExtensionReal(req.file.buffer);
+    if (!ext) throw errorHttp(400, MENSAJE_ARCHIVO_INVALIDO);
 
     let rutasDocumentos = procesoRes.rows[0].rutas_documentos || {};
     if (typeof rutasDocumentos === 'string') rutasDocumentos = JSON.parse(rutasDocumentos);
@@ -1824,10 +1830,8 @@ app.post('/api/inventario/documentos', verificarToken, verificarRol(ROLES_ADMIN)
     const { cfg, id } = await validarElementoInventario(req, nivel, req.body.id_elemento);
     if (!cfg.tipos[tipo]) throw errorHttp(400, 'Ese tipo de documento no corresponde al nivel seleccionado.');
 
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    if (!firmaBufferValida(req.file.buffer, ext)) {
-      throw errorHttp(400, 'El contenido del archivo no corresponde a su formato (PDF, JPG o PNG).');
-    }
+    const ext = detectarExtensionReal(req.file.buffer);
+    if (!ext) throw errorHttp(400, MENSAJE_ARCHIVO_INVALIDO);
     const nombreOriginal = nombreArchivoSeguro(req.file.originalname);
 
     nombreAlmacenado = `${crypto.randomBytes(16).toString('hex')}${ext}`;
