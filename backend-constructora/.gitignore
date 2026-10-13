@@ -4,7 +4,7 @@ node_modules
 # Secretos y configuración local (NUNCA subir a Git)
 .env
 .env.*
-!.env.example
+.env.example
 
 # Archivos de usuarios: documentos de clientes y del inventario
 uploads/
@@ -13,3 +13,5 @@ ine_cliente.jpg
 
 # Logs
 *.log
+
+.gitignore
