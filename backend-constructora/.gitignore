@@ -16,3 +16,5 @@ ine_cliente.jpg
 
 respaldos/
 *.backup
+
+api.http

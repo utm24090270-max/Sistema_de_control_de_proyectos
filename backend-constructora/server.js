@@ -36,7 +36,7 @@ const ORIGENES_PERMITIDOS = (process.env.CORS_ORIGIN || 'http://localhost:5173,h
 app.use(cors({
   origin: (origin, cb) => cb(null, !origin || ORIGENES_PERMITIDOS.includes(origin)) // sin origin = herramientas/servidor
 }));
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
 
 // Límite de intentos en login y registro (npm install express-rate-limit)
 let limitarAutenticacion = (req, res, next) => next();
@@ -56,6 +56,37 @@ try {
 // En producción no se devuelven detalles internos (mensajes de SQL, etc.) al cliente
 const detalleError = (err) => (process.env.NODE_ENV === 'production' ? undefined : err.message);
 
+// El JWT_SECRET debe existir y ser largo: sin él cualquiera podría falsificar sesiones
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  const msg = 'JWT_SECRET no está definido o tiene menos de 32 caracteres.';
+  if (process.env.NODE_ENV === 'production') {
+    console.error(`❌ ${msg} El servidor no se inicia en producción.`);
+    process.exit(1);
+  }
+  console.warn(`⚠️ ${msg} Usa uno largo y aleatorio antes de desplegar.`);
+}
+
+// En producción se exige HTTPS (el proxy de Azure indica el protocolo original en x-forwarded-proto)
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV === 'production' && req.headers['x-forwarded-proto'] === 'http') {
+    if (req.method === 'GET' || req.method === 'HEAD') return res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+    return res.status(400).json({ error: 'Esta API solo acepta conexiones HTTPS.' });
+  }
+  next();
+});
+
+// Límite general de solicitudes por IP a toda la API (además del límite estricto de login y registro)
+try {
+  const { rateLimit } = require('express-rate-limit');
+  app.use('/api', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 600,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'Demasiadas solicitudes. Intenta de nuevo en unos minutos.' }
+  }));
+} catch (e) { /* el aviso de instalación ya se mostró arriba */ }
+
 // ==========================================
 // MIDDLEWARES DE SEGURIDAD (JWT Y ROLES)
 // ==========================================
@@ -68,7 +99,7 @@ const verificarToken = (req, res, next) => {
   }
 
   try {
-    const usuarioVerificado = jwt.verify(token, process.env.JWT_SECRET);
+    const usuarioVerificado = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     req.usuario = usuarioVerificado;
     next();
   } catch (err) {
@@ -99,6 +130,110 @@ const esStaff = (usuario) => ROLES_STAFF.includes(usuario?.rol?.toUpperCase());
 // Un CLIENTE solo puede tocar expedientes ligados a su propio id_cliente
 const puedeAccederProceso = (usuario, idClienteDelProceso) =>
   esStaff(usuario) || (usuario?.id_cliente && Number(usuario.id_cliente) === Number(idClienteDelProceso));
+
+// ------------------------------------------------------------------
+// VALIDACIÓN DE ENTRADAS Y UTILIDADES DE SEGURIDAD
+// ------------------------------------------------------------------
+const TIPOS_CONSTRUCCION = ['Residencial', 'Comercial', 'Industrial', 'Infraestructura', 'Mixto'];
+const FORMAS_PAGO = ['C.infonavit', 'C.bancario', 'C.cofinavit', 'C.directo', 'C.directo plazos', 'C.isspea', 'C.cofoviste'];
+const ETAPAS_VENTA = ['Evaluación', 'Formalización', 'Armado de expediente', 'Avalúos', 'Gestoría', 'Notaría', 'Firma', 'Pagos', 'Entrega'];
+const CLAVES_PROHIBIDAS = ['__proto__', 'constructor', 'prototype'];
+
+const idEntero = (valor) => {
+  const n = Number(valor);
+  return Number.isInteger(n) && n > 0 && n < 2147483647 ? n : null;
+};
+
+// Texto de entrada: tipo string, longitud máxima y sin etiquetas ni caracteres de control.
+// undefined -> undefined (no enviado) | null -> null | '' -> ''
+const textoSeguro = (valor, campo, max, { obligatorio = false } = {}) => {
+  if (valor === undefined || valor === null) {
+    if (obligatorio) throw errorHttp(400, `${campo} es obligatorio.`);
+    return valor;
+  }
+  if (typeof valor !== 'string') throw errorHttp(400, `${campo} no es válido.`);
+  const t = valor.trim();
+  if (!t && obligatorio) throw errorHttp(400, `${campo} es obligatorio.`);
+  if (t.length > max) throw errorHttp(400, `${campo} no puede exceder ${max} caracteres.`);
+  if (/[<>\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(t)) throw errorHttp(400, `${campo} contiene caracteres no permitidos.`);
+  return t;
+};
+
+const validarEmail = (valor, campo = 'El correo electrónico', { obligatorio = false } = {}) => {
+  const t = textoSeguro(valor, campo, 100, { obligatorio });
+  if (t === undefined || t === null || t === '') return t;
+  if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(t)) throw errorHttp(400, `${campo} no tiene un formato válido.`);
+  return t.toLowerCase();
+};
+
+// Valor que debe pertenecer a una lista cerrada (vacío = sin asignar = null)
+const valorDeLista = (valor, lista, campo) => {
+  if (valor === undefined) return undefined;
+  if (valor === null || valor === '') return null;
+  if (typeof valor !== 'string') throw errorHttp(400, `${campo} no es válido.`);
+  const canonico = lista.find((x) => x.toLowerCase() === valor.trim().toLowerCase());
+  if (!canonico) throw errorHttp(400, `${campo} no es válido.`);
+  return canonico;
+};
+
+const validarEstadosBinarios = (obj) => {
+  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) throw errorHttp(400, 'Los estados del expediente no son válidos.');
+  const claves = Object.keys(obj);
+  if (claves.length > 100) throw errorHttp(400, 'Los estados del expediente no son válidos.');
+  const limpio = {};
+  for (const k of claves) {
+    if (k.length > 80 || CLAVES_PROHIBIDAS.includes(k) || typeof obj[k] !== 'boolean') {
+      throw errorHttp(400, 'Los estados del expediente no son válidos.');
+    }
+    limpio[k] = obj[k];
+  }
+  return limpio;
+};
+
+// Paginación opcional (?limite=&pagina=) con tope máximo: sin parámetros devuelve hasta "maximo" registros
+const paginacion = (req, maximo = 1000) => {
+  const limite = Math.min(Math.max(parseInt(req.query.limite, 10) || maximo, 1), maximo);
+  const pagina = Math.max(parseInt(req.query.pagina, 10) || 1, 1);
+  return { limite, desplazamiento: (pagina - 1) * limite };
+};
+
+// Perfil de cliente de una cuenta: primero el ligado por id_usuario; por correo solo si NO pertenece a otra cuenta
+async function resolverIdCliente(db, usuario) {
+  if (usuario?.id_cliente) return Number(usuario.id_cliente);
+  if (!usuario?.id_usuario) return null;
+  const r = await db.query(
+    `SELECT id_cliente FROM cliente
+     WHERE id_usuario = $1 OR (id_usuario IS NULL AND LOWER(email) = LOWER($2))
+     ORDER BY (id_usuario = $1) DESC NULLS LAST, id_cliente
+     LIMIT 1`,
+    [usuario.id_usuario, usuario.email || '']
+  );
+  return r.rows[0]?.id_cliente ?? null;
+}
+
+// Bloqueo temporal por cuenta tras varios intentos fallidos de inicio de sesión (en memoria de esta instancia)
+const MAX_FALLOS_LOGIN = 5;
+const BLOQUEO_LOGIN_MS = 15 * 60 * 1000;
+const intentosLogin = new Map();
+const minutosDeBloqueo = (clave) => {
+  const e = intentosLogin.get(clave);
+  if (!e || !e.bloqueadoHasta) return 0;
+  const resta = e.bloqueadoHasta - Date.now();
+  if (resta <= 0) { intentosLogin.delete(clave); return 0; }
+  return Math.ceil(resta / 60000);
+};
+const registrarFalloLogin = (clave) => {
+  const e = intentosLogin.get(clave) || { fallos: 0, bloqueadoHasta: 0 };
+  e.fallos += 1;
+  if (e.fallos >= MAX_FALLOS_LOGIN) { e.bloqueadoHasta = Date.now() + BLOQUEO_LOGIN_MS; e.fallos = 0; }
+  intentosLogin.set(clave, e);
+};
+setInterval(() => {
+  const ahora = Date.now();
+  for (const [k, e] of intentosLogin) if (!e.bloqueadoHasta || e.bloqueadoHasta < ahora) { if (e.fallos === 0 || e.bloqueadoHasta < ahora) intentosLogin.delete(k); }
+}, 30 * 60 * 1000).unref();
+// Hash de relleno: el login tarda igual exista o no el correo (evita descubrir correos por el tiempo de respuesta)
+const HASH_RELLENO = bcrypt.hashSync('relleno-no-usar', 10);
 
 // ------------------------------------------------------------------
 // CÓDIGO DE INVENTARIO DE LOTES
@@ -382,15 +517,40 @@ const recibirArchivo = (campo) => (req, res, next) =>
 
 // POST: Registrar un nuevo usuario + cliente + expediente inicial de compra
 app.post('/api/auth/registro', limitarAutenticacion, async (req, res) => {
-  const { nombre, apellido, email, password, telefono, curp, rfc, direccion, tipo_construccion, institucion_financiera, id_empresa } = req.body;
+  let { nombre, apellido, email, password, telefono, curp, rfc, direccion, tipo_construccion, institucion_financiera } = req.body;
   // El registro público NUNCA asigna lote: lo asigna un ADMIN/ASESOR después
   const id_terreno = null;
-  const empresaID = id_empresa || 1;
-  
+  // Siempre la empresa principal: no se acepta id_empresa desde el cliente
+  const empresaID = 1;
+
+  try {
+    nombre = textoSeguro(nombre, 'El nombre', 100, { obligatorio: true });
+    apellido = textoSeguro(apellido, 'El apellido', 100) || '';
+    email = validarEmail(email, 'El correo electrónico', { obligatorio: true });
+    telefono = textoSeguro(telefono, 'El teléfono', 20);
+    curp = textoSeguro(curp, 'La CURP', 18);
+    rfc = textoSeguro(rfc, 'El RFC', 20);
+    direccion = textoSeguro(direccion, 'La dirección', 255);
+    tipo_construccion = valorDeLista(tipo_construccion, TIPOS_CONSTRUCCION, 'El tipo de construcción');
+    institucion_financiera = valorDeLista(institucion_financiera, FORMAS_PAGO, 'La forma de pago');
+    if (typeof password !== 'string' || password.length < 8 || password.length > 72) {
+      throw errorHttp(400, 'La contraseña debe tener entre 8 y 72 caracteres.');
+    }
+  } catch (e) {
+    return res.status(e.status || 400).json({ error: e.message });
+  }
+
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
+
+    // Correo duplicado, sin distinguir mayúsculas
+    const yaExiste = await client.query('SELECT 1 FROM usuario WHERE LOWER(email) = LOWER($1)', [email]);
+    if (yaExiste.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'El correo electrónico ya está registrado' });
+    }
 
     // 1. Encriptar contraseña
     const saltRounds = 10;
@@ -468,6 +628,17 @@ app.post('/api/auth/registro', limitarAutenticacion, async (req, res) => {
 app.post('/api/auth/login', limitarAutenticacion, async (req, res) => {
   const { email, password } = req.body;
   try {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password || email.length > 100 || password.length > 200) {
+      return res.status(400).json({ error: 'Credenciales inválidas' });
+    }
+    // Bloqueo temporal de la cuenta tras varios intentos fallidos
+    const claveLogin = email.trim().toLowerCase();
+    const espera = minutosDeBloqueo(claveLogin);
+    if (espera) {
+      return res.status(429).json({ error: `Demasiados intentos fallidos. Intenta de nuevo en ${espera} minuto(s).` });
+    }
+
+    // El perfil de cliente se liga por id_usuario; por correo solo si ese perfil no pertenece a otra cuenta
     const userResult = await pool.query(
       `SELECT u.*, 
               COALESCE(c.id_cliente, NULL) AS id_cliente, 
@@ -478,21 +649,21 @@ app.post('/api/auth/login', limitarAutenticacion, async (req, res) => {
               c.nombre AS cliente_nombre, 
               c.apellido AS cliente_apellido 
        FROM usuario u 
-       LEFT JOIN cliente c ON (u.id_usuario = c.id_usuario OR u.email = c.email)
-       WHERE u.email = $1`, 
-      [email]
+       LEFT JOIN cliente c ON (c.id_usuario = u.id_usuario OR (c.id_usuario IS NULL AND LOWER(c.email) = LOWER(u.email)))
+       WHERE LOWER(u.email) = LOWER($1)
+       ORDER BY (c.id_usuario = u.id_usuario) DESC NULLS LAST, c.id_cliente
+       LIMIT 1`, 
+      [email.trim()]
     );
 
-    if (userResult.rows.length === 0) {
-      return res.status(400).json({ error: 'Credenciales inválidas' });
-    }
-
     const user = userResult.rows[0];
-
-    const validPassword = await bcrypt.compare(password, user.password_hash);
-    if (!validPassword) {
+    // Siempre se compara contra un hash: el tiempo de respuesta no revela si el correo existe
+    const validPassword = await bcrypt.compare(password, user ? user.password_hash : HASH_RELLENO);
+    if (!user || !validPassword) {
+      registrarFalloLogin(claveLogin);
       return res.status(400).json({ error: 'Credenciales inválidas' });
     }
+    intentosLogin.delete(claveLogin);
 
     const token = jwt.sign(
       { 
@@ -503,7 +674,7 @@ app.post('/api/auth/login', limitarAutenticacion, async (req, res) => {
         email: user.email
       },
       process.env.JWT_SECRET,
-      { expiresIn: '8h' }
+      { algorithm: 'HS256', expiresIn: '8h' }
     );
 
     res.json({
@@ -542,36 +713,52 @@ app.get('/api/health', (req, res) => {
 // RUTAS DE CLIENTES
 // ==========================================
 
+const COLUMNAS_CLIENTE = 'id_cliente, id_empresa, id_usuario, nombre, apellido, curp, rfc, direccion, email, telefono, created_at';
+
 app.get('/api/clientes', verificarToken, verificarRol(ROLES_STAFF), async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM cliente ORDER BY id_cliente DESC');
+    const { limite, desplazamiento } = paginacion(req, 1000);
+    const result = await pool.query(
+      `SELECT ${COLUMNAS_CLIENTE} FROM cliente ORDER BY id_cliente DESC LIMIT $1 OFFSET $2`, [limite, desplazamiento]);
     res.json(result.rows);
   } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: 'Error al consultar los clientes' });
+    responderError(res, err, 'Error al consultar los clientes');
   }
 });
 
 app.post('/api/clientes', verificarToken, verificarRol(ROLES_STAFF), async (req, res) => {
-  const { id_empresa, nombre, apellido, curp, rfc, direccion, email, telefono } = req.body;
   try {
+    const nombre = textoSeguro(req.body.nombre, 'El nombre', 100, { obligatorio: true });
+    const apellido = textoSeguro(req.body.apellido, 'El apellido', 100) || '';
+    const curp = textoSeguro(req.body.curp, 'La CURP', 18);
+    const rfc = textoSeguro(req.body.rfc, 'El RFC', 20);
+    const direccion = textoSeguro(req.body.direccion, 'La dirección', 255);
+    const email = validarEmail(req.body.email);
+    const telefono = textoSeguro(req.body.telefono, 'El teléfono', 20);
+
     const newClient = await pool.query(
       `INSERT INTO cliente (id_empresa, nombre, apellido, curp, rfc, direccion, email, telefono)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [id_empresa || 1, nombre, apellido, curp || null, rfc || null, direccion || null, email, telefono || null]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING ${COLUMNAS_CLIENTE}`,
+      [empresaAlta(req), nombre, apellido, curp || null, rfc || null, direccion || null, email || null, telefono || null]
     );
     res.status(201).json(newClient.rows[0]);
   } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: 'Error al registrar el cliente' });
+    responderError(res, err, 'Error al registrar el cliente');
   }
 });
 
 app.put('/api/clientes/:id', verificarToken, verificarRol(ROLES_STAFF), async (req, res) => {
-  const { id } = req.params;
-  const { nombre, apellido, curp, rfc, direccion, email, telefono } = req.body;
-
   try {
+    const id = idEntero(req.params.id);
+    if (!id) throw errorHttp(400, 'Identificador inválido.');
+    const nombre = textoSeguro(req.body.nombre, 'El nombre', 100);
+    const apellido = textoSeguro(req.body.apellido, 'El apellido', 100);
+    const curp = textoSeguro(req.body.curp, 'La CURP', 18);
+    const rfc = textoSeguro(req.body.rfc, 'El RFC', 20);
+    const direccion = textoSeguro(req.body.direccion, 'La dirección', 255);
+    const email = validarEmail(req.body.email);
+    const telefono = textoSeguro(req.body.telefono, 'El teléfono', 20);
+
     const updateResult = await pool.query(
       `UPDATE cliente 
        SET nombre = COALESCE(NULLIF($1, ''), nombre),
@@ -581,21 +768,18 @@ app.put('/api/clientes/:id', verificarToken, verificarRol(ROLES_STAFF), async (r
            direccion = COALESCE(NULLIF($5, ''), direccion),
            email = COALESCE(NULLIF($6, ''), email),
            telefono = COALESCE(NULLIF($7, ''), telefono)
-       WHERE id_cliente = $8 RETURNING *`,
+       WHERE id_cliente = $8 RETURNING ${COLUMNAS_CLIENTE}`,
       [nombre, apellido, curp, rfc, direccion, email, telefono, id]
     );
 
-    if (updateResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Cliente no encontrado' });
-    }
+    if (updateResult.rows.length === 0) throw errorHttp(404, 'Cliente no encontrado');
 
     res.json({
       mensaje: 'Cliente actualizado correctamente',
       cliente: updateResult.rows[0]
     });
   } catch (err) {
-    console.error('❌ Error al actualizar cliente:', err.message);
-    res.status(500).json({ error: 'Error al actualizar datos del cliente' });
+    responderError(res, err, 'Error al actualizar datos del cliente');
   }
 });
 
@@ -603,9 +787,10 @@ app.put('/api/clientes/:id', verificarToken, verificarRol(ROLES_STAFF), async (r
 // RUTAS PARA TERRENOS / PROPIEDADES
 // ==========================================
 
-app.get('/api/terrenos', verificarToken, async (req, res) => {
+app.get('/api/terrenos', verificarToken, verificarRol(ROLES_STAFF), async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM terreno ORDER BY manzana ASC, num_lote ASC');
+    const { limite, desplazamiento } = paginacion(req, 1000);
+    const result = await pool.query('SELECT * FROM terreno ORDER BY manzana ASC, num_lote ASC LIMIT $1 OFFSET $2', [limite, desplazamiento]);
     res.json(result.rows);
   } catch (err) {
     console.error(err.message);
@@ -622,10 +807,23 @@ const consultarLotesDisponibles = async (req, res) => {
       `SELECT v.* FROM v_lote_inventario v
        WHERE v.estado = 'DISPONIBLE'
          AND ($1::int IS NULL OR v.id_empresa = $1)
-       ORDER BY ${ORDEN_LOTES_SQL}`,
-      [empresaDe(req)]
+       ORDER BY ${ORDEN_LOTES_SQL}
+       LIMIT $2`,
+      [empresaDe(req), 2000]
     );
-    res.json(result.rows.map(normalizarLote));
+    const lotes = result.rows.map(normalizarLote);
+    // El personal recibe el detalle completo; un cliente solo los datos necesarios para elegir un lote
+    res.json(esStaff(req.usuario) ? lotes : lotes.map((l) => ({
+      id_lote: l.id_lote,
+      codigo_inventario: l.codigo_inventario,
+      fraccionamiento: l.fraccionamiento,
+      condominio: l.condominio,
+      num_manzana: l.num_manzana,
+      num_lote: l.num_lote,
+      m2: l.m2,
+      precio: l.precio,
+      estado: l.estado
+    })));
   } catch (err) {
     console.error('❌ Error al consultar lotes disponibles:', err.message);
     res.status(500).json({ error: 'Error al consultar lotes disponibles' });
@@ -634,17 +832,26 @@ const consultarLotesDisponibles = async (req, res) => {
 app.get('/api/lotes/disponibles', verificarToken, verificarRol(ROLES_STAFF), consultarLotesDisponibles);
 
 app.post('/api/terrenos', verificarToken, verificarRol(['ADMIN', 'ADMINISTRADOR', 'ASESOR']), async (req, res) => {
-  const { id_empresa, num_lote, manzana, m2, precio, estado } = req.body;
   try {
+    const num_lote = textoSeguro(req.body.num_lote, 'El número de lote', 50, { obligatorio: true });
+    const manzana = textoSeguro(req.body.manzana, 'La manzana', 50);
+    const m2 = Number(req.body.m2);
+    const precio = Number(req.body.precio);
+    if (!(m2 > 0)) throw errorHttp(400, 'Los m² deben ser un número mayor a 0.');
+    if (!(precio >= 0) || req.body.precio === '' || req.body.precio === null || req.body.precio === undefined) {
+      throw errorHttp(400, 'El precio debe ser un número igual o mayor a 0.');
+    }
+    const estado = req.body.estado ? String(req.body.estado).toUpperCase() : 'DISPONIBLE';
+    if (!['DISPONIBLE', 'RESERVADO', 'VENDIDO'].includes(estado)) throw errorHttp(400, 'El estado del terreno no es válido.');
+
     const newTerreno = await pool.query(
       `INSERT INTO terreno (id_empresa, num_lote, manzana, m2, precio, estado)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [id_empresa || 1, num_lote, manzana, m2, precio, estado || 'DISPONIBLE']
+      [empresaAlta(req), num_lote, manzana || null, m2, precio, estado]
     );
     res.status(201).json(newTerreno.rows[0]);
   } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: 'Error al registrar terreno' });
+    responderError(res, err, 'Error al registrar terreno');
   }
 });
 
@@ -658,10 +865,7 @@ app.get('/api/procesos-venta', verificarToken, async (req, res) => {
     const { rol, id_usuario, email } = req.usuario;
     const esAdmin = ['ADMIN', 'ADMINISTRADOR', 'ASESOR'].includes(rol?.toUpperCase());
 
-    if (!esAdmin && !id_cliente && id_usuario) {
-      const cRes = await pool.query('SELECT id_cliente FROM cliente WHERE id_usuario = $1 OR email = $2', [id_usuario, email]);
-      if (cRes.rows.length > 0) id_cliente = cRes.rows[0].id_cliente;
-    }
+    if (!esAdmin && !id_cliente) id_cliente = await resolverIdCliente(pool, req.usuario);
 
     let query = `
       SELECT 
@@ -709,7 +913,9 @@ app.get('/api/procesos-venta', verificarToken, async (req, res) => {
       params.push(id_cliente || 0);
     }
 
-    query += ` ORDER BY pv.id_proceso DESC`;
+    const { limite, desplazamiento } = paginacion(req, 1000);
+    query += ` ORDER BY pv.id_proceso DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limite, desplazamiento);
 
     const result = await pool.query(query, params);
     res.json(result.rows);
@@ -728,15 +934,10 @@ app.post('/api/procesos-venta/regenerar-cliente', verificarToken, async (req, re
   try {
     await client.query('BEGIN');
 
-    if (!id_cliente && req.usuario.id_usuario) {
-      const clienteRes = await client.query(
-        `SELECT id_cliente FROM cliente WHERE id_usuario = $1 OR email = $2`,
-        [req.usuario.id_usuario, req.usuario.email]
-      );
-      if (clienteRes.rows.length > 0) {
-        id_cliente = clienteRes.rows[0].id_cliente;
-      }
-    }
+    const tipoConstruccionValido = valorDeLista(tipo_construccion, TIPOS_CONSTRUCCION, 'El tipo de construcción');
+    const institucionValida = valorDeLista(institucion_financiera, FORMAS_PAGO, 'La forma de pago');
+
+    if (!id_cliente) id_cliente = await resolverIdCliente(client, req.usuario);
 
     if (!id_cliente) {
       await client.query('ROLLBACK');
@@ -760,8 +961,8 @@ app.post('/api/procesos-venta/regenerar-cliente', verificarToken, async (req, re
        RETURNING *`,
       [
         id_cliente, 
-        tipo_construccion || null, 
-        institucion_financiera || null
+        tipoConstruccionValido || null, 
+        institucionValida || null
       ]
     );
 
@@ -773,6 +974,7 @@ app.post('/api/procesos-venta/regenerar-cliente', verificarToken, async (req, re
     });
   } catch (err) {
     await client.query('ROLLBACK');
+    if (err.status) return res.status(err.status).json({ error: err.message });
     console.error('❌ Error exacto al regenerar expediente:', err);
     res.status(500).json({ 
       error: 'Error al generar expediente', details: detalleError(err)
@@ -871,7 +1073,7 @@ app.get('/api/procesos-venta/:id/documento/:tipo', verificarToken, async (req, r
 //    id_cliente del body). Si es para otra persona, se marca es_para_tercero y se guardan
 //    los datos del tercero en las columnas tercero_*.
 app.post('/api/procesos-venta', verificarToken, async (req, res) => {
-  const {
+  let {
     id_cliente,
     nombre,
     apellido,
@@ -899,11 +1101,29 @@ app.post('/api/procesos-venta', verificarToken, async (req, res) => {
 
     const staff = esStaff(req.usuario);
 
+    // ---- Validación de entradas ----
+    if (id_cliente && !idEntero(id_cliente)) throw errorHttp(400, 'El cliente indicado no es válido.');
+    nombre = textoSeguro(nombre, 'El nombre', 100);
+    apellido = textoSeguro(apellido, 'El apellido', 100);
+    if (email) email = validarEmail(email);
+    telefono = textoSeguro(telefono, 'El teléfono', 20);
+    curp = textoSeguro(curp, 'La CURP', 18);
+    rfc = textoSeguro(rfc, 'El RFC', 20);
+    direccion = textoSeguro(direccion, 'La dirección', 255);
+    tercero_nombre_completo = textoSeguro(tercero_nombre_completo, 'El nombre del tercero', 255);
+    tercero_telefono = textoSeguro(tercero_telefono, 'El teléfono del tercero', 20);
+    if (tercero_email) tercero_email = validarEmail(tercero_email, 'El correo del tercero');
+    const tipoConstruccionValido = valorDeLista(tipo_construccion, TIPOS_CONSTRUCCION, 'El tipo de construcción');
+    const institucionValida = valorDeLista(institucion_financiera, FORMAS_PAGO, 'La forma de pago');
+    // Un cliente nunca define la etapa ni las autorizaciones: el expediente siempre inicia en Evaluación y sin autorizaciones
+    const etapaInicial = staff ? (valorDeLista(etapa_actual, ETAPAS_VENTA, 'La etapa') || 'Evaluación') : 'Evaluación';
+    const estadosIniciales = staff && estados_binarios !== undefined ? validarEstadosBinarios(estados_binarios) : {};
+
     // Solo un ADMIN o ASESOR puede asignar un lote, y siempre desde el inventario
     const loteSolicitado = staff && id_lote ? parseInt(id_lote, 10) : null;
 
-    const tipoConstruccionFinal = tipo_construccion || null;
-    const institucionFinancieraFinal = institucion_financiera || null;
+    const tipoConstruccionFinal = tipoConstruccionValido || null;
+    const institucionFinancieraFinal = institucionValida || null;
     const emailNormalizado = email ? String(email).trim().toLowerCase() : null;
 
     let clienteIDFinal = null;
@@ -949,15 +1169,7 @@ app.post('/api/procesos-venta', verificarToken, async (req, res) => {
       }
     } else {
       // ---- CLIENTE: siempre su propia cuenta ----
-      clienteIDFinal = req.usuario.id_cliente;
-
-      if (!clienteIDFinal && req.usuario.id_usuario) {
-        const cRes = await client.query(
-          'SELECT id_cliente FROM cliente WHERE id_usuario = $1 OR email = $2',
-          [req.usuario.id_usuario, req.usuario.email]
-        );
-        if (cRes.rows.length > 0) clienteIDFinal = cRes.rows[0].id_cliente;
-      }
+      clienteIDFinal = await resolverIdCliente(client, req.usuario);
 
       if (es_para_tercero === true || es_para_tercero === 'true') {
         marcarTercero = true;
@@ -1011,9 +1223,9 @@ app.post('/api/procesos-venta', verificarToken, async (req, res) => {
         null,
         tipoConstruccionFinal,
         institucionFinancieraFinal,
-        etapa_actual || 'Evaluación',
+        etapaInicial,
         '{}', // las rutas de documentos solo se crean al subir archivos, nunca desde el cuerpo de la petición
-        JSON.stringify(estados_binarios || {}),
+        JSON.stringify(estadosIniciales),
         marcarTercero,
         datosTercero.nombre,
         datosTercero.telefono,
@@ -1080,7 +1292,7 @@ app.put('/api/procesos-venta/:id/lote', verificarToken, verificarRol(ROLES_STAFF
 
 app.put('/api/procesos-venta/:id', verificarToken, async (req, res) => {
   const { id } = req.params;
-  const { 
+  let { 
     etapa_actual, 
     tipo_construccion, 
     institucion_financiera, 
@@ -1103,6 +1315,8 @@ app.put('/api/procesos-venta/:id', verificarToken, async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    if (!idEntero(id)) throw errorHttp(400, 'Identificador inválido.');
+
     const procesoRes = await client.query('SELECT id_cliente, id_terreno, COALESCE(es_para_tercero, false) AS es_para_tercero FROM proceso_venta WHERE id_proceso = $1', [id]);
     if (procesoRes.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -1114,6 +1328,36 @@ app.put('/api/procesos-venta/:id', verificarToken, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'No tienes permisos sobre este expediente.' });
     }
+
+    // Solo el personal (ADMIN/ASESOR) puede cambiar la etapa o las autorizaciones. Si un cliente las envía, se ignoran.
+    if (!esStaff(req.usuario) && (etapa_actual !== undefined || estados_binarios !== undefined)) {
+      console.warn(`⚠️ El usuario ${req.usuario.id_usuario} (cliente) intentó cambiar etapa/autorizaciones del expediente ${id}: se ignoró.`);
+      etapa_actual = undefined;
+      estados_binarios = undefined;
+    }
+
+    // ---- Validación de entradas ----
+    tipo_construccion = valorDeLista(tipo_construccion, TIPOS_CONSTRUCCION, 'El tipo de construcción');
+    institucion_financiera = valorDeLista(institucion_financiera, FORMAS_PAGO, 'La forma de pago');
+    if (etapa_actual !== undefined) {
+      const etapaValida = valorDeLista(etapa_actual, ETAPAS_VENTA, 'La etapa');
+      if (!etapaValida) throw errorHttp(400, 'La etapa no es válida.');
+      etapa_actual = etapaValida;
+    }
+    if (estados_binarios !== undefined) estados_binarios = validarEstadosBinarios(estados_binarios);
+    if (rutas_documentos !== undefined && (rutas_documentos === null || typeof rutas_documentos !== 'object' || Array.isArray(rutas_documentos))) {
+      throw errorHttp(400, 'Los documentos del expediente no son válidos.');
+    }
+    curp = textoSeguro(curp, 'La CURP', 18);
+    rfc = textoSeguro(rfc, 'El RFC', 20);
+    direccion = textoSeguro(direccion, 'La dirección', 255);
+    telefono = textoSeguro(telefono, 'El teléfono', 20);
+    tercero_nombre_completo = textoSeguro(tercero_nombre_completo, 'El nombre del tercero', 255);
+    tercero_telefono = textoSeguro(tercero_telefono, 'El teléfono del tercero', 20);
+    tercero_curp = textoSeguro(tercero_curp, 'La CURP del tercero', 18);
+    tercero_rfc = textoSeguro(tercero_rfc, 'El RFC del tercero', 20);
+    tercero_direccion = textoSeguro(tercero_direccion, 'La dirección del tercero', 255);
+    if (tercero_email) tercero_email = validarEmail(tercero_email, 'El correo del tercero');
 
     if (es_para_tercero) {
       // Expediente de tercero: los datos personales se guardan en las columnas tercero_* del expediente.
@@ -1224,6 +1468,7 @@ app.put('/api/procesos-venta/:id', verificarToken, async (req, res) => {
     });
   } catch (err) {
     await client.query('ROLLBACK');
+    if (err.status) return res.status(err.status).json({ error: err.message });
     console.error('❌ Error al actualizar expediente:', err.message);
     res.status(500).json({ error: 'Error al actualizar el expediente', details: detalleError(err) });
   } finally {
@@ -1234,6 +1479,7 @@ app.put('/api/procesos-venta/:id', verificarToken, async (req, res) => {
 // DELETE: Eliminar expediente (Borrado Lógico) - Solo Admin / Asesor
 app.delete('/api/procesos-venta/:id', verificarToken, verificarRol(['ADMIN', 'ADMINISTRADOR', 'ASESOR']), async (req, res) => {
   const { id } = req.params;
+  if (!idEntero(id)) return res.status(400).json({ error: 'Identificador inválido.' });
 
   try {
     const procesoRes = await pool.query('SELECT id_terreno, id_lote FROM proceso_venta WHERE id_proceso = $1', [id]);
@@ -1255,32 +1501,35 @@ app.delete('/api/procesos-venta/:id', verificarToken, verificarRol(['ADMIN', 'AD
 
 // POST: Agregar observaciones / mensajes en un expediente
 app.post('/api/procesos-venta/:id/comentario', verificarToken, async (req, res) => {
-  const { id } = req.params;
-  const { comentario } = req.body;
-
   try {
-    const procesoRes = await pool.query('SELECT observaciones, id_cliente FROM proceso_venta WHERE id_proceso = $1', [id]);
-    if (procesoRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Expediente no encontrado' });
-    }
+    const id = idEntero(req.params.id);
+    if (!id) throw errorHttp(400, 'Identificador inválido.');
+    const comentario = textoSeguro(req.body.comentario, 'El mensaje', 1000, { obligatorio: true });
+
+    const procesoRes = await pool.query(
+      "SELECT id_cliente, LENGTH(COALESCE(observaciones, '')) AS largo FROM proceso_venta WHERE id_proceso = $1", [id]);
+    if (procesoRes.rows.length === 0) throw errorHttp(404, 'Expediente no encontrado');
     if (!puedeAccederProceso(req.usuario, procesoRes.rows[0].id_cliente)) {
-      return res.status(403).json({ error: 'No tienes permisos sobre este expediente.' });
+      throw errorHttp(403, 'No tienes permisos sobre este expediente.');
+    }
+    if (Number(procesoRes.rows[0].largo) > 100000) {
+      throw errorHttp(400, 'Los mensajes de este expediente alcanzaron su tamaño máximo.');
     }
 
     const fecha = new Date().toLocaleString('es-MX');
     const mensajeFormateado = `[${fecha}] (${req.usuario.rol}): ${comentario}`;
-    const observacionesPrevias = procesoRes.rows[0].observaciones || '';
-    const nuevasObservaciones = observacionesPrevias ? `${observacionesPrevias}\n${mensajeFormateado}` : mensajeFormateado;
 
-    await pool.query(
-      'UPDATE proceso_venta SET observaciones = $1 WHERE id_proceso = $2',
-      [nuevasObservaciones, id]
+    // Se agrega en una sola operación: dos mensajes simultáneos no se pisan entre sí
+    const r = await pool.query(
+      `UPDATE proceso_venta
+       SET observaciones = CASE WHEN COALESCE(observaciones, '') = '' THEN $1::text ELSE observaciones || E'\n' || $1::text END
+       WHERE id_proceso = $2 RETURNING observaciones`,
+      [mensajeFormateado, id]
     );
 
-    res.json({ mensaje: 'Mensaje registrado con éxito', observaciones: nuevasObservaciones });
+    res.json({ mensaje: 'Mensaje registrado con éxito', observaciones: r.rows[0].observaciones });
   } catch (err) {
-    console.error('❌ Error al guardar comentario:', err.message);
-    res.status(500).json({ error: 'Error al registrar el mensaje' });
+    responderError(res, err, 'Error al registrar el mensaje');
   }
 });
 
@@ -1290,7 +1539,8 @@ app.post('/api/procesos-venta/:id/comentario', verificarToken, async (req, res) 
 
 app.get('/api/bitacora', verificarToken, verificarRol(['ADMIN', 'ADMINISTRADOR']), async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM bitacora_auditoria ORDER BY id_bitacora DESC');
+    const { limite, desplazamiento } = paginacion(req, 500);
+    const result = await pool.query('SELECT * FROM bitacora_auditoria ORDER BY id_bitacora DESC LIMIT $1 OFFSET $2', [limite, desplazamiento]);
     res.json(result.rows);
   } catch (err) {
     console.error(err.message);
@@ -1345,7 +1595,8 @@ app.get('/api/inventario/lotes', verificarToken, verificarRol(ROLES_ADMIN), asyn
     const result = await pool.query(
       `SELECT v.* FROM v_lote_inventario v
        WHERE ($1::int IS NULL OR v.id_empresa = $1)
-       ORDER BY ${ORDEN_LOTES_SQL}`, [empresaDe(req)]);
+       ORDER BY ${ORDEN_LOTES_SQL}
+       LIMIT $2 OFFSET $3`, [empresaDe(req), ...Object.values(paginacion(req, 2000))]);
     res.json(result.rows.map(normalizarLote));
   } catch (err) {
     responderError(res, err, 'Error al consultar el inventario');
@@ -1510,14 +1761,15 @@ app.post('/api/inventario/lotes', verificarToken, verificarRol(ROLES_ADMIN), asy
 });
 
 // ---------- SOLICITUDES DE LOTE ----------
-const idClienteDeUsuario = async (usuario) => {
-  if (usuario?.id_cliente) return Number(usuario.id_cliente);
-  if (!usuario?.id_usuario) return null;
-  const r = await pool.query('SELECT id_cliente FROM cliente WHERE id_usuario = $1 OR email = $2', [usuario.id_usuario, usuario.email]);
-  return r.rows[0]?.id_cliente ?? null;
+const idClienteDeUsuario = (usuario) => resolverIdCliente(pool, usuario);
+
+// Un cliente no necesita ver quién del personal resolvió ni el correo del solicitante
+const sinInternos = (solicitud) => {
+  const { admin_nombre, solicitante_email, ...resto } = solicitud;
+  return resto;
 };
 
-const consultarSolicitudes = async (db, { idSolicitud = null, idCliente = null, estado = null, idEmpresa = null }) => {
+const consultarSolicitudes = async (db, { idSolicitud = null, idCliente = null, estado = null, idEmpresa = null, limite = 500, desplazamiento = 0 }) => {
   const r = await db.query(
     `SELECT s.id_solicitud, s.id_proceso, s.id_lote, s.estado, s.comentarios,
             s.fecha_solicitud, s.fecha_resolucion, s.motivo_resolucion,
@@ -1538,8 +1790,9 @@ const consultarSolicitudes = async (db, { idSolicitud = null, idCliente = null, 
        AND ($2::int IS NULL OR pv.id_cliente = $2)
        AND ($3::text IS NULL OR s.estado = $3)
        AND ($4::int IS NULL OR v.id_empresa = $4)
-     ORDER BY s.id_solicitud DESC`,
-    [idSolicitud, idCliente, estado, idEmpresa]);
+     ORDER BY s.id_solicitud DESC
+     LIMIT $5 OFFSET $6`,
+    [idSolicitud, idCliente, estado, idEmpresa, limite, desplazamiento]);
   return r.rows.map((row) => ({
     ...normalizarLote(row),
     titular_expediente: nombreTitular(row)
@@ -1550,12 +1803,15 @@ const consultarSolicitudes = async (db, { idSolicitud = null, idCliente = null, 
 app.get('/api/solicitudes-lote', verificarToken, async (req, res) => {
   try {
     const estado = req.query.estado ? String(req.query.estado).toUpperCase() : null;
+    if (estado && !['PENDIENTE', 'APROBADA', 'RECHAZADA', 'CANCELADA'].includes(estado)) throw errorHttp(400, 'El estado solicitado no es válido.');
+    const { limite, desplazamiento } = paginacion(req, 500);
     if (esAdminInventario(req.usuario)) {
-      return res.json(await consultarSolicitudes(pool, { estado, idEmpresa: empresaDe(req) }));
+      return res.json(await consultarSolicitudes(pool, { estado, idEmpresa: empresaDe(req), limite, desplazamiento }));
     }
     const idCliente = await idClienteDeUsuario(req.usuario);
     if (!idCliente) return res.json([]);
-    res.json(await consultarSolicitudes(pool, { idCliente, estado }));
+    const propias = await consultarSolicitudes(pool, { idCliente, estado, limite, desplazamiento });
+    res.json(propias.map(sinInternos));
   } catch (err) {
     responderError(res, err, 'Error al consultar las solicitudes de lote');
   }
@@ -1567,7 +1823,7 @@ app.get('/api/solicitudes-lote/:id', verificarToken, async (req, res) => {
     if (!esAdminInventario(req.usuario) && !idCliente) throw errorHttp(403, 'No tienes permisos para consultar esta solicitud.');
     const lista = await consultarSolicitudes(pool, { idSolicitud: parseInt(req.params.id, 10), idCliente });
     if (lista.length === 0) throw errorHttp(404, 'Solicitud no encontrada.');
-    res.json(lista[0]);
+    res.json(esAdminInventario(req.usuario) ? lista[0] : sinInternos(lista[0]));
   } catch (err) {
     responderError(res, err, 'Error al consultar la solicitud');
   }
@@ -1596,7 +1852,7 @@ app.post('/api/solicitudes-lote', verificarToken, async (req, res) => {
     if (lt.rows.length === 0) throw errorHttp(404, 'El lote seleccionado no existe.');
     if (lt.rows[0].estado !== 'DISPONIBLE') throw errorHttp(409, 'El lote seleccionado ya no está disponible.');
 
-    const comentarios = String(req.body.comentarios ?? '').trim() || null;
+    const comentarios = textoSeguro(req.body.comentarios, 'Los comentarios', 500) || null;
     let r;
     try {
       r = await pool.query(
@@ -1666,7 +1922,7 @@ app.put('/api/solicitudes-lote/:id/aprobar', verificarToken, verificarRol(ROLES_
       `UPDATE solicitud_lote SET estado = 'APROBADA', id_usuario_admin = $1,
               fecha_resolucion = CURRENT_TIMESTAMP, motivo_resolucion = $2
        WHERE id_solicitud = $3`,
-      [req.usuario.id_usuario, String(req.body?.motivo ?? '').trim() || null, s0.id_solicitud]);
+      [req.usuario.id_usuario, textoSeguro(req.body?.motivo, 'El motivo', 500) || null, s0.id_solicitud]);
 
     await client.query('COMMIT');
     res.json({ mensaje: 'Solicitud aprobada y lote asignado.', id_lote: s0.id_lote, codigo_inventario: resultado.codigo });
@@ -1685,7 +1941,7 @@ app.put('/api/solicitudes-lote/:id/rechazar', verificarToken, verificarRol(ROLES
       `UPDATE solicitud_lote SET estado = 'RECHAZADA', id_usuario_admin = $1,
               fecha_resolucion = CURRENT_TIMESTAMP, motivo_resolucion = $2
        WHERE id_solicitud = $3 AND estado = 'PENDIENTE' RETURNING id_solicitud`,
-      [req.usuario.id_usuario, String(req.body?.motivo ?? '').trim() || null, parseInt(req.params.id, 10)]);
+      [req.usuario.id_usuario, textoSeguro(req.body?.motivo, 'El motivo', 500) || null, parseInt(req.params.id, 10)]);
     if (r.rows.length === 0) throw errorHttp(409, 'La solicitud no existe o ya no está pendiente.');
     res.json({ mensaje: 'Solicitud rechazada.' });
   } catch (err) {
@@ -1911,6 +2167,17 @@ app.get('/api/inventario/documentos/:id/archivo', verificarToken, verificarRol(R
   } catch (err) {
     responderError(res, err, 'Error al consultar el documento');
   }
+});
+
+// ==========================================
+// RUTAS NO ENCONTRADAS Y ERRORES GENERALES (siempre en JSON, sin trazas internas)
+// ==========================================
+app.use('/api', (req, res) => res.status(404).json({ error: 'Ruta no encontrada' }));
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError)) return res.status(400).json({ error: 'La solicitud no tiene un formato válido.' });
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'La solicitud es demasiado grande.' });
+  console.error('❌ Error no controlado:', err && err.message);
+  res.status(500).json({ error: 'Error interno del servidor' });
 });
 
 // ==========================================

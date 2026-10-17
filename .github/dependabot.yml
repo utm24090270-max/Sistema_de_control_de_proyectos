@@ -1,0 +1,13 @@
+# GitHub revisará cada semana las dependencias y abrirá avisos / solicitudes cuando haya versiones con vulnerabilidades.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/backend-constructora"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "npm"
+    directory: "/frontend-constructora"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
